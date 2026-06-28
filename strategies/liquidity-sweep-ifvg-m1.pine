@@ -1,0 +1,257 @@
+//@version=5
+strategy('Liquidity Sweep (1H) + IFVG (M1) Strategy', 'LS-IFVG-M1'
+     , overlay=true
+     , max_lines_count=500
+     , max_boxes_count=500
+     , max_bars_back=5000
+     , calc_on_every_tick=false
+     , default_qty_type=strategy.percent_of_equity
+     , default_qty_value=100)
+
+//-----------------------------------------------------------------------------}
+//Inputs
+//-----------------------------------------------------------------------------{
+g_sweep = 'Liquidity Sweep (HTF)'
+htf      = input.timeframe('60', 'Sweep Timeframe', group=g_sweep)
+swLen    = input.int(5, 'Swing Length', minval=1, group=g_sweep)
+sweepOpt = input.string('Wicks + Outbreaks & Retest', 'Sweep Mode'
+         , options=['Only Wicks', 'Only Outbreaks & Retest', 'Wicks + Outbreaks & Retest'], group=g_sweep)
+sweepValidBars = input.int(50, 'Sweep Valid For (M1 bars)', minval=1, group=g_sweep
+         , tooltip='Number of M1 bars after a sweep during which an IFVG entry is allowed.')
+
+g_ifvg = 'IFVG (M1)'
+ifvgSrc  = input.string('Wick', 'FVG Fill Source', options=['Wick', 'Close'], group=g_ifvg
+         , tooltip='Wick = high/low used to detect inversion, Close = candle close used to detect inversion.')
+
+g_sl = 'Stop Loss'
+slMode = input.string('Recent Swing', 'Stop Loss Mode', options=['Recent Swing', 'Entry Candle High/Low'], group=g_sl)
+slSwingLen = input.int(5, 'Recent Swing Length', minval=1, group=g_sl)
+slBuffer   = input.float(0.0, 'SL Buffer (ticks)', minval=0, group=g_sl)
+
+g_tp = 'Target'
+tpMode    = input.string('R/R Based', 'Target Mode', options=['R/R Based', 'Trail Based'], group=g_tp)
+rr        = input.float(2.0, 'Risk/Reward Ratio', minval=0.1, step=0.1, group=g_tp)
+trailMode = input.string('ATR Trail', 'Trail Mode', options=['ATR Trail', 'Ticks Trail'], group=g_tp)
+atrLen    = input.int(14, 'ATR Length', minval=1, group=g_tp)
+atrMult   = input.float(2.0, 'ATR Multiplier', minval=0.1, step=0.1, group=g_tp)
+trailTicks = input.int(100, 'Trail Ticks', minval=1, group=g_tp)
+
+g_vis = 'Visuals'
+colBuy  = input.color(#089981, 'Buy Color', group=g_vis)
+colSell = input.color(#f23645, 'Sell Color', group=g_vis)
+showIfvgBoxes = input.bool(true, 'Show IFVG Boxes', group=g_vis)
+
+//-----------------------------------------------------------------------------}
+//UDTs
+//-----------------------------------------------------------------------------{
+type piv
+    float prc
+    int   bix
+    bool  brk
+    bool  mit
+    bool  tak
+    bool  wic
+
+type fvg
+    float top
+    float bot
+    int   bix
+    int   dir   // 1 = bullish fvg, -1 = bearish fvg
+    bool  inverted
+
+//-----------------------------------------------------------------------------}
+//State
+//-----------------------------------------------------------------------------{
+var array<piv> aPivH = array.new<piv>()
+var array<piv> aPivL = array.new<piv>()
+var array<fvg> aFvg  = array.new<fvg>()
+
+var int  lastSweepDir = 0     // 1 = bullish sweep (buy bias), -1 = bearish sweep (sell bias)
+var int  lastSweepBar = na
+
+oW = sweepOpt == 'Only Wicks'
+oO = sweepOpt == 'Only Outbreaks & Retest'
+
+n = bar_index
+
+//-----------------------------------------------------------------------------}
+//1H Liquidity Sweep detection (computed on HTF series, mapped to M1)
+//-----------------------------------------------------------------------------{
+[htfHigh, htfLow, htfClose, htfBarIdx] = request.security(syminfo.tickerid, htf, [high, low, close, bar_index], lookahead=barmerge.lookahead_off)
+
+var float htfPrevBarIdx = na
+isNewHtfBar = htfBarIdx != htfPrevBarIdx
+htfPrevBarIdx := htfBarIdx
+
+htfPh = ta.pivothigh(htfHigh, swLen, swLen)
+htfPl = ta.pivotlow(htfLow, swLen, swLen)
+
+if isNewHtfBar and not na(htfPh)
+    aPivH.unshift(piv.new(htfPh, int(htfBarIdx) - swLen, false, false, false, false))
+
+if isNewHtfBar and not na(htfPl)
+    aPivL.unshift(piv.new(htfPl, int(htfBarIdx) - swLen, false, false, false, false))
+
+bearSweepNow = false
+bullSweepNow = false
+
+if isNewHtfBar
+    for i = aPivH.size() - 1 to 0
+        get = aPivH.get(i)
+        if not get.mit
+            if not get.brk
+                if htfClose > get.prc
+                    if not oW
+                        get.brk := true
+                    else
+                        get.mit := true
+                if not oO and not get.wic
+                    if htfHigh > get.prc and htfClose < get.prc
+                        bearSweepNow := true
+                        get.wic := true
+            else
+                if htfClose < get.prc
+                    get.mit := true
+                if not oW and htfLow < get.prc and htfClose > get.prc
+                    bullSweepNow := true
+                    get.tak := true
+        if int(htfBarIdx) - get.bix > 2000 or get.mit or get.tak
+            aPivH.remove(i)
+
+    for i = aPivL.size() - 1 to 0
+        get = aPivL.get(i)
+        if not get.mit
+            if not get.brk
+                if htfClose < get.prc
+                    if not oW
+                        get.brk := true
+                    else
+                        get.mit := true
+                if not oO and not get.wic
+                    if htfLow < get.prc and htfClose > get.prc
+                        bullSweepNow := true
+                        get.wic := true
+            else
+                if htfClose > get.prc
+                    get.mit := true
+                if not oW and htfHigh > get.prc and htfClose < get.prc
+                    bearSweepNow := true
+                    get.tak := true
+        if int(htfBarIdx) - get.bix > 2000 or get.mit or get.tak
+            aPivL.remove(i)
+
+if bullSweepNow
+    lastSweepDir := 1
+    lastSweepBar := n
+if bearSweepNow
+    lastSweepDir := -1
+    lastSweepBar := n
+
+sweepActive = not na(lastSweepBar) and (n - lastSweepBar) <= sweepValidBars
+
+//-----------------------------------------------------------------------------}
+//M1 FVG detection + Inversion (IFVG)
+//-----------------------------------------------------------------------------{
+bullFvgNow = low > high[2]
+bearFvgNow = high < low[2]
+
+if bullFvgNow
+    aFvg.unshift(fvg.new(low, high[2], n - 1, 1, false))
+if bearFvgNow
+    aFvg.unshift(fvg.new(low[2], high, n - 1, -1, false))
+
+bullIfvgConfirmed = false  // bullish IFVG -> buy signal
+bearIfvgConfirmed = false  // bearish IFVG -> sell signal
+var float ifvgTop = na
+var float ifvgBot = na
+
+for i = aFvg.size() - 1 to 0
+    g = aFvg.get(i)
+    if not g.inverted
+        fillVal = ifvgSrc == 'Wick' ? (g.dir == 1 ? low : high) : close
+        if g.dir == 1 and fillVal < g.bot
+            g.inverted := true
+            if close < g.bot
+                bearIfvgConfirmed := true
+                ifvgTop := g.top
+                ifvgBot := g.bot
+        if g.dir == -1 and fillVal > g.top
+            g.inverted := true
+            if close > g.top
+                bullIfvgConfirmed := true
+                ifvgTop := g.top
+                ifvgBot := g.bot
+    if n - g.bix > 500
+        aFvg.remove(i)
+
+if showIfvgBoxes
+    if bearIfvgConfirmed
+        box.new(n - 1, ifvgTop, n, ifvgBot, border_color=colSell, bgcolor=color.new(colSell, 85))
+    if bullIfvgConfirmed
+        box.new(n - 1, ifvgTop, n, ifvgBot, border_color=colBuy, bgcolor=color.new(colBuy, 85))
+
+//-----------------------------------------------------------------------------}
+//Entry signals
+//-----------------------------------------------------------------------------{
+longSignal  = sweepActive and lastSweepDir == 1 and bullIfvgConfirmed
+shortSignal = sweepActive and lastSweepDir == -1 and bearIfvgConfirmed
+
+if longSignal
+    label.new(n, low, '▲', yloc=yloc.belowbar, color=color.new(colBuy, 0), style=label.style_label_up, textcolor=color.white, size=size.tiny)
+if shortSignal
+    label.new(n, high, '▼', yloc=yloc.abovebar, color=color.new(colSell, 0), style=label.style_label_down, textcolor=color.white, size=size.tiny)
+
+//-----------------------------------------------------------------------------}
+//Stop loss calculation
+//-----------------------------------------------------------------------------{
+swingHigh = ta.pivothigh(slSwingLen, slSwingLen)
+swingLow  = ta.pivotlow(slSwingLen, slSwingLen)
+var float lastSwingHigh = na
+var float lastSwingLow  = na
+if not na(swingHigh)
+    lastSwingHigh := swingHigh
+if not na(swingLow)
+    lastSwingLow := swingLow
+
+tick = syminfo.mintick
+
+longSL()  =>
+    slMode == 'Recent Swing' ? (na(lastSwingLow) ? low - slBuffer * tick : lastSwingLow - slBuffer * tick) : low - slBuffer * tick
+
+shortSL() =>
+    slMode == 'Recent Swing' ? (na(lastSwingHigh) ? high + slBuffer * tick : lastSwingHigh + slBuffer * tick) : high + slBuffer * tick
+
+//-----------------------------------------------------------------------------}
+//Execution / Orders
+//-----------------------------------------------------------------------------{
+atrVal = ta.atr(atrLen)
+
+if longSignal and strategy.position_size == 0
+    entryPrice = close
+    slPrice = longSL()
+    risk = entryPrice - slPrice
+    if risk > 0
+        strategy.entry('Long', strategy.long)
+        if tpMode == 'R/R Based'
+            tpPrice = entryPrice + risk * rr
+            strategy.exit('Long Exit', 'Long', stop=slPrice, limit=tpPrice)
+        else
+            if trailMode == 'ATR Trail'
+                strategy.exit('Long Exit', 'Long', stop=slPrice, trail_points=atrVal * atrMult / tick, trail_offset=atrVal * atrMult / tick)
+            else
+                strategy.exit('Long Exit', 'Long', stop=slPrice, trail_points=trailTicks, trail_offset=trailTicks)
+
+if shortSignal and strategy.position_size == 0
+    entryPrice = close
+    slPrice = shortSL()
+    risk = slPrice - entryPrice
+    if risk > 0
+        strategy.entry('Short', strategy.short)
+        if tpMode == 'R/R Based'
+            tpPrice = entryPrice - risk * rr
+            strategy.exit('Short Exit', 'Short', stop=slPrice, limit=tpPrice)
+        else
+            if trailMode == 'ATR Trail'
+                strategy.exit('Short Exit', 'Short', stop=slPrice, trail_points=atrVal * atrMult / tick, trail_offset=atrVal * atrMult / tick)
+            else
+                strategy.exit('Short Exit', 'Short', stop=slPrice, trail_points=trailTicks, trail_offset=trailTicks)
