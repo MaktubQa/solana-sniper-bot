@@ -40,6 +40,9 @@ g_vis = 'Visuals'
 colBuy  = input.color(#089981, 'Buy Color', group=g_vis)
 colSell = input.color(#f23645, 'Sell Color', group=g_vis)
 showIfvgBoxes = input.bool(true, 'Show IFVG Boxes', group=g_vis)
+showSweeps    = input.bool(true, 'Show 1H Sweep Levels', group=g_vis)
+showBias      = input.bool(true, 'Show Active Bias Background', group=g_vis)
+showSlTp      = input.bool(true, 'Show SL/TP Lines', group=g_vis)
 
 //-----------------------------------------------------------------------------}
 //UDTs
@@ -94,6 +97,8 @@ if isNewHtfBar and not na(htfPl)
 
 bearSweepNow = false
 bullSweepNow = false
+float bearSweepLvl = na
+float bullSweepLvl = na
 
 if isNewHtfBar
     for i = aPivH.size() - 1 to 0
@@ -108,12 +113,14 @@ if isNewHtfBar
                 if not oO and not get.wic
                     if htfHigh > get.prc and htfClose < get.prc
                         bearSweepNow := true
+                        bearSweepLvl := get.prc
                         get.wic := true
             else
                 if htfClose < get.prc
                     get.mit := true
                 if not oW and htfLow < get.prc and htfClose > get.prc
                     bullSweepNow := true
+                    bullSweepLvl := get.prc
                     get.tak := true
         if int(htfBarIdx) - get.bix > 2000 or get.mit or get.tak
             aPivH.remove(i)
@@ -130,12 +137,14 @@ if isNewHtfBar
                 if not oO and not get.wic
                     if htfLow < get.prc and htfClose > get.prc
                         bullSweepNow := true
+                        bullSweepLvl := get.prc
                         get.wic := true
             else
                 if htfClose > get.prc
                     get.mit := true
                 if not oW and htfHigh > get.prc and htfClose < get.prc
                     bearSweepNow := true
+                    bearSweepLvl := get.prc
                     get.tak := true
         if int(htfBarIdx) - get.bix > 2000 or get.mit or get.tak
             aPivL.remove(i)
@@ -147,7 +156,19 @@ if bearSweepNow
     lastSweepDir := -1
     lastSweepBar := n
 
+//-----------------------------------------------------------------------------}
+//1H Sweep visuals (drawn on M1 chart)
+//-----------------------------------------------------------------------------{
+if showSweeps and bullSweepNow and not na(bullSweepLvl)
+    line.new(n, bullSweepLvl, n + 10, bullSweepLvl, color=colBuy, width=2, style=line.style_dashed)
+    label.new(n, bullSweepLvl, '1H Sweep ↑', yloc=yloc.price, color=color.new(colBuy, 20), textcolor=color.white, style=label.style_label_up, size=size.small)
+if showSweeps and bearSweepNow and not na(bearSweepLvl)
+    line.new(n, bearSweepLvl, n + 10, bearSweepLvl, color=colSell, width=2, style=line.style_dashed)
+    label.new(n, bearSweepLvl, '1H Sweep ↓', yloc=yloc.price, color=color.new(colSell, 20), textcolor=color.white, style=label.style_label_down, size=size.small)
+
 sweepActive = not na(lastSweepBar) and (n - lastSweepBar) <= sweepValidBars
+
+bgcolor(showBias and sweepActive ? (lastSweepDir == 1 ? color.new(colBuy, 92) : color.new(colSell, 92)) : na, title='Active Bias')
 
 //-----------------------------------------------------------------------------}
 //M1 FVG detection + Inversion (IFVG)
@@ -232,9 +253,13 @@ if longSignal and strategy.position_size == 0
     risk = entryPrice - slPrice
     if risk > 0
         strategy.entry('Long', strategy.long)
+        if showSlTp
+            line.new(n, slPrice, n + 15, slPrice, color=colSell, width=1, style=line.style_dotted)
         if tpMode == 'R/R Based'
             tpPrice = entryPrice + risk * rr
             strategy.exit('Long Exit', 'Long', stop=slPrice, limit=tpPrice)
+            if showSlTp
+                line.new(n, tpPrice, n + 15, tpPrice, color=colBuy, width=1, style=line.style_dotted)
         else
             if trailMode == 'ATR Trail'
                 strategy.exit('Long Exit', 'Long', stop=slPrice, trail_points=atrVal * atrMult / tick, trail_offset=atrVal * atrMult / tick)
@@ -247,9 +272,13 @@ if shortSignal and strategy.position_size == 0
     risk = slPrice - entryPrice
     if risk > 0
         strategy.entry('Short', strategy.short)
+        if showSlTp
+            line.new(n, slPrice, n + 15, slPrice, color=colSell, width=1, style=line.style_dotted)
         if tpMode == 'R/R Based'
             tpPrice = entryPrice - risk * rr
             strategy.exit('Short Exit', 'Short', stop=slPrice, limit=tpPrice)
+            if showSlTp
+                line.new(n, tpPrice, n + 15, tpPrice, color=colBuy, width=1, style=line.style_dotted)
         else
             if trailMode == 'ATR Trail'
                 strategy.exit('Short Exit', 'Short', stop=slPrice, trail_points=atrVal * atrMult / tick, trail_offset=atrVal * atrMult / tick)
